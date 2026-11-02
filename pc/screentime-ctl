@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""screentime-ctl – Schnittstelle zwischen der Screentime-App und Timekpr-nExT.
+
+Die App ruft dieses Programm per SSH auf:
+    sudo -n /usr/local/sbin/screentime-ctl <befehl> [argumente]
+
+Jede Ausgabe ist JSON. Alle Eingaben werden streng geprüft, weil das
+Programm mit root-Rechten läuft.
+
+Befehle:
+    ping                       Verbindung testen
+    status                     Restzeit, Limits, Programmnutzung
+    bonus <+|-|=> <sekunden>   Tageszeit ändern (Bonus / Abzug / setzen)
+    playbonus <+|-|=> <sek>    Spielzeit ändern
+    limits <base64-json>       Tageslimits, Uhrzeiten, Spielzeit, Sperrart setzen
+    apps <base64-json>         Liste der erfassten Programme speichern
+"""
+import base64
+import datetime
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+VERSION = 1
+CONF_DIR = "/etc/screentime"
+CONFIG = os.path.join(CONF_DIR, "config.json")
+APPS = os.path.join(CONF_DIR, "apps.json")
+DB = "/var/lib/screentime/usage.db"
+TIMEKPRA = "/usr/bin/timekpra"
+
+LOCKOUT_TYPES = {"terminate", "lock", "shutdown", "suspend", "kill"}
+PROC_RE = re.compile(r"[A-Za-z0-9._+-]{1,40}")
+CONTAINS_RE = re.compile(r"[A-Za-z0-9._/ +-]{0,40}")
+
+
+# ---------------------------------------------------------------- Hilfen
+
+def out(obj, code=0):
+    print(json.dumps(obj, ensure_ascii=False))
+    sys.exit(code)
+
+
+def fail(msg):
+    out({"ok": False, "error": msg}, 1)
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def child():
+    name = load_json(CONFIG, {}).get("child", "")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name or ""):
+        fail("Kein gültiges Kinderkonto in /etc/screentime/config.json")
+    return name
+
+
+def tk(*args):
+    try:
+        p = subprocess.run([TIMEKPRA, *args], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        fail("timekpr-next ist nicht installiert")
+    except subprocess.TimeoutExpired:
+        fail("Timekpr antwortet nicht")
+    text = (p.stdout + "\n" + p.stderr).strip()
+    return p.returncode, text
+
+
+def tk_must(*args):
+    rc, text = tk(*args)
+    if rc != 0 or re.search(r"^\s*error", text, re.I | re.M):
+        fail("Timekpr-Fehler bei %s: %s" % (args[0], text[-300:]))
+    return text
+
+
+def parse_info(text):
+    info = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip()
+        if re.fullmatch(r"[A-Z0-9_]+", key):
+            info[key] = val.strip()
+    return info
+
+
+def ival(d, key):
+    try:
+        return int(str(d.get(key, "")).split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def nums(text):
+    return [int(x) for x in re.findall(r"\d+", text or "")]
+
+
+def is_true(v):
+    return str(v).strip().lower() in ("true", "1", "yes")
+
+
+def secs_arg(v):
+    try:
+        n = int(v)
+    except ValueError:
+        fail("Ungültige Zeitangabe")
+    if not 0 <= n <= 86400:
+        fail("Zeitangabe außerhalb des erlaubten Bereichs")
+    return n
+
+
+def op_arg(v):
+    if v not in ("+", "-", "="):
+        fail("Ungültige Rechenart")
+    return v
+
+
+def b64json(v):
+    try:
+        return json.loads(base64.b64decode(v, validate=True).decode("utf-8"))
+    except Exception:
+        fail("Ungültige Daten von der App")
+
+
+# ---------------------------------------------------------------- Nutzung pro Programm
+
+def app_usage():
+    today = datetime.date.today()
+    week_start = today - datetime.timedelta(days=6)
+    res = {"today": {}, "week": {}, "days": {}}
+    if not os.path.exists(DB):
+        return res
+    try:
+        con = sqlite3.connect(DB, timeout=5)
+        for day, app, sec in con.execute(
+                "SELECT day, app, seconds FROM usage WHERE day >= ?", (week_start.isoformat(),)):
+            res["week"][app] = res["week"].get(app, 0) + sec
+            res["days"].setdefault(day, {})[app] = sec
+            if day == today.isoformat():
+                res["today"][app] = sec
+        con.close()
+    except sqlite3.Error:
+        pass
+    return res
+
+
+# ---------------------------------------------------------------- Befehle
+
+def cmd_status():
+    user = child()
+    rc, text = tk("--userinfo", user)
+    if rc != 0:
+        fail("Timekpr kennt %s noch nicht. Bitte %s einmal am PC anmelden lassen." % (user, user))
+    info = parse_info(text)
+    rc2, text2 = tk("--userinfort", user)
+    rt = parse_info(text2) if rc2 == 0 else {}
+    live = "ACTUAL_TIME_LEFT_DAY" in rt
+
+    days = nums(info.get("ALLOWED_WEEKDAYS"))
+    lims = nums(info.get("LIMITS_PER_WEEKDAYS"))
+    limits = {str(d): (lims[i] if i < len(lims) else 0) for i, d in enumerate(days)}
+
+    hours = {}
+    for d in range(1, 8):
+        hs = set()
+        for part in info.get("ALLOWED_HOURS_%d" % d, "").split(";"):
+            m = re.match(r"\s*!?(\d{1,2})", part)
+            if m:
+                hs.add(int(m.group(1)))
+        hours[str(d)] = sorted(hs)
+
+    today = datetime.date.today()
+    wd = str(today.isoweekday())
+    limit_today = limits.get(wd, 0)
+
+    # Gespeicherte Werte gehören evtl. zu einem älteren Tag
+    stale = False
+    last = info.get("LAST_CHECKED", "")
+    if last[:10] and last[:10] != today.isoformat():
+        stale = True
+
+    if live:
+        spent = ival(rt, "ACTUAL_TIME_SPENT_DAY") or 0
+        left = ival(rt, "ACTUAL_TIME_LEFT_DAY") or 0
+    else:
+        spent = 0 if stale else (ival(info, "TIME_SPENT_DAY") or 0)
+        balance = 0 if stale else (ival(info, "TIME_SPENT_BALANCE") or spent)
+        left = max(0, limit_today - balance)
+
+    pt_days = nums(info.get("PLAYTIME_ALLOWED_WEEKDAYS"))
+    pt_lims = nums(info.get("PLAYTIME_LIMITS_PER_WEEKDAYS"))
+    pt_limits = {str(d): (pt_lims[i] if i < len(pt_lims) else 0) for i, d in enumerate(pt_days)}
+    pt_enabled = is_true(info.get("PLAYTIME_ENABLED", "false"))
+    pt_spent = 0 if stale else (ival(rt, "ACTUAL_PLAYTIME_SPENT_DAY")
+                                or ival(info, "PLAYTIME_SPENT_DAY") or 0)
+    pt_left = ival(rt, "ACTUAL_PLAYTIME_LEFT_DAY")
+    if pt_left is None:
+        pt_bal = 0 if stale else (ival(info, "PLAYTIME_SPENT_BALANCE") or pt_spent)
+        pt_left = max(0, pt_limits.get(wd, 0) - pt_bal)
+
+    out({
+        "ok": True,
+        "version": VERSION,
+        "child": user,
+        "live": live,
+        "weekday": int(wd),
+        "today": {"limit": limit_today, "spent": spent, "left": left},
+        "limits": limits,
+        "hours": hours,
+        "lockout": (info.get("LOCKOUT_TYPE", "terminate").split(";")[0] or "terminate"),
+        "playtime": {
+            "enabled": pt_enabled,
+            "limits": pt_limits,
+            "spent": pt_spent,
+            "left": pt_left,
+        },
+        "usage": app_usage(),
+        "apps": load_json(APPS, []),
+        "raw": {"info": info, "rt": rt},
+    })
+
+
+def cmd_bonus(op, secs, playtime=False):
+    user = child()
+    flag = "--setplaytimeleft" if playtime else "--settimeleft"
+    tk_must(flag, user, op_arg(op), str(secs_arg(secs)))
+    out({"ok": True})
+
+
+def cmd_limits(data):
+    user = child()
+    if not isinstance(data, dict):
+        fail("Ungültige Limits")
+
+    days = {}
+    for k, v in (data.get("days") or {}).items():
+        if k not in {str(i) for i in range(1, 8)}:
+            fail("Ungültiger Wochentag")
+        days[int(k)] = secs_arg(v)
+    if not days:
+        fail("Mindestens ein Tag muss erlaubt sein")
+    order = sorted(days)
+
+    hours = data.get("hours") or {"from": 0, "to": 24}
+    try:
+        h_from, h_to = int(hours["from"]), int(hours["to"])
+    except (KeyError, ValueError, TypeError):
+        fail("Ungültige Uhrzeiten")
+    if not (0 <= h_from < h_to <= 24):
+        fail("Die Startzeit muss vor der Endzeit liegen")
+
+    lockout = data.get("lockout", "terminate")
+    if lockout not in LOCKOUT_TYPES:
+        fail("Ungültige Sperrart")
+
+    tk_must("--setalloweddays", user, ";".join(str(d) for d in order))
+    tk_must("--settimelimits", user, ";".join(str(days[d]) for d in order))
+    tk_must("--setallowedhours", user, "ALL", ";".join(str(h) for h in range(h_from, h_to)))
+    tk_must("--settimelimitweek", user, "604800")
+    tk_must("--settimelimitmonth", user, "2678400")
+    tk_must("--setlockouttype", user, lockout)
+
+    pt = data.get("playtime")
+    if isinstance(pt, dict):
+        enabled = bool(pt.get("enabled"))
+        tk_must("--setplaytimeenabled", user, "true" if enabled else "false")
+        if enabled:
+            pt_secs = secs_arg(pt.get("seconds", 3600))
+            tk_must("--setplaytimealloweddays", user, ";".join(str(d) for d in order))
+            tk_must("--setplaytimelimits", user, ";".join(str(min(pt_secs, days[d])) for d in order))
+            apply_playtime_activities(user, load_json(APPS, []))
+    out({"ok": True})
+
+
+def clean_name(s):
+    s = re.sub(r"[\x00-\x1f;\[\]\"'\\]", "", str(s)).strip()
+    return s[:40]
+
+
+def validate_apps(data):
+    if not isinstance(data, list) or len(data) > 30:
+        fail("Ungültige Programmliste")
+    apps = []
+    for a in data:
+        if not isinstance(a, dict):
+            fail("Ungültiger Programmeintrag")
+        name = clean_name(a.get("name", ""))
+        procs = a.get("procs") or []
+        if not name or not isinstance(procs, list) or not 1 <= len(procs) <= 8:
+            fail("Jedes Programm braucht einen Namen und 1–8 Prozessnamen")
+        for p in procs:
+            if not isinstance(p, str) or not PROC_RE.fullmatch(p):
+                fail("Ungültiger Prozessname: %s" % p)
+        contains = a.get("contains") or ""
+        if not isinstance(contains, str) or not CONTAINS_RE.fullmatch(contains):
+            fail("Ungültiger Suchtext bei %s" % name)
+        apps.append({"name": name, "procs": procs, "contains": contains,
+                     "game": bool(a.get("game"))})
+    return apps
+
+
+def apply_playtime_activities(user, apps):
+    masks = []
+    for a in apps:
+        if a.get("game"):
+            for p in a["procs"]:
+                masks.append("%s[%s]" % (re.escape(p), clean_name(a["name"])))
+    if masks:
+        tk_must("--setplaytimeactivities", user, ";".join(masks))
+
+
+def cmd_apps(data):
+    user = child()
+    apps = validate_apps(data)
+    write_json(APPS, apps)
+    rc, text = tk("--userinfo", user)
+    if rc == 0 and is_true(parse_info(text).get("PLAYTIME_ENABLED", "false")):
+        apply_playtime_activities(user, apps)
+    out({"ok": True})
+
+
+def main():
+    a = sys.argv[1:]
+    if os.geteuid() != 0:
+        fail("screentime-ctl muss mit sudo laufen")
+    if not a:
+        fail("Kein Befehl angegeben")
+    cmd = a[0]
+    if cmd == "ping" and len(a) == 1:
+        out({"ok": True, "version": VERSION, "child": child()})
+    if cmd == "status" and len(a) == 1:
+        cmd_status()
+    if cmd == "bonus" and len(a) == 3:
+        cmd_bonus(a[1], a[2])
+    if cmd == "playbonus" and len(a) == 3:
+        cmd_bonus(a[1], a[2], playtime=True)
+    if cmd == "limits" and len(a) == 2:
+        cmd_limits(b64json(a[1]))
+    if cmd == "apps" and len(a) == 2:
+        cmd_apps(b64json(a[1]))
+    fail("Unbekannter Befehl")
+
+
+if __name__ == "__main__":
+    main()

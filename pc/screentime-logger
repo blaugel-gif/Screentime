@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""screentime-logger – erfasst, wie lange das Kind welche Programme nutzt.
+
+Läuft als Systemdienst (root). Prüft jede Minute, welche der in
+/etc/screentime/apps.json eingetragenen Programme in der Sitzung des
+Kindes laufen, und addiert die Zeit pro Tag in einer SQLite-Datenbank.
+
+Gezählt wird nur, solange das Kind eine aktive, nicht gesperrte
+Sitzung hat.
+"""
+import datetime
+import json
+import os
+import pwd
+import sqlite3
+import subprocess
+import time
+
+INTERVAL = 60
+CONFIG = "/etc/screentime/config.json"
+APPS = "/etc/screentime/apps.json"
+DB_DIR = "/var/lib/screentime"
+DB = os.path.join(DB_DIR, "usage.db")
+KEEP_DAYS = 90
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def open_db():
+    os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+    con = sqlite3.connect(DB, timeout=10)
+    con.execute("CREATE TABLE IF NOT EXISTS usage ("
+                "day TEXT NOT NULL, app TEXT NOT NULL, seconds INTEGER NOT NULL, "
+                "PRIMARY KEY (day, app))")
+    con.commit()
+    os.chmod(DB, 0o600)
+    return con
+
+
+def session_active(user):
+    """True, wenn der Benutzer eine aktive, entsperrte Sitzung hat.
+    Falls loginctl nicht klappt, wird sicherheitshalber gezählt."""
+    try:
+        p = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                           capture_output=True, text=True, timeout=10)
+        ids = [line.split()[0] for line in p.stdout.splitlines()
+               if len(line.split()) >= 3 and line.split()[2] == user]
+        if not ids:
+            return False
+        for sid in ids:
+            q = subprocess.run(["loginctl", "show-session", sid, "-p", "Active", "-p", "LockedHint"],
+                               capture_output=True, text=True, timeout=10)
+            props = dict(l.split("=", 1) for l in q.stdout.splitlines() if "=" in l)
+            if props.get("Active") == "yes" and props.get("LockedHint") != "yes":
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def scan(uid):
+    procs = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat("/proc/" + pid).st_uid != uid:
+                continue
+            with open("/proc/%s/comm" % pid) as f:
+                comm = f.read().strip().lower()
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="ignore").strip().lower()
+        except OSError:
+            continue
+        argv0 = os.path.basename(cmd.split(" ", 1)[0]) if cmd else ""
+        procs.append((comm, argv0, cmd))
+    return procs
+
+
+def running(app, procs):
+    names = [str(p).lower() for p in app.get("procs", [])]
+    contains = str(app.get("contains") or "").lower()
+    for comm, argv0, cmd in procs:
+        hit = any(comm == n[:15] or argv0 == n for n in names)
+        if hit and (not contains or contains in cmd):
+            return True
+    return False
+
+
+def main():
+    con = open_db()
+    last = time.monotonic()
+    last_prune = None
+    while True:
+        time.sleep(INTERVAL)
+        now = time.monotonic()
+        elapsed = int(min(now - last, 2 * INTERVAL))
+        last = now
+
+        user = load_json(CONFIG, {}).get("child", "")
+        apps = load_json(APPS, [])
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+        except KeyError:
+            continue
+        if not apps or not session_active(user):
+            continue
+
+        procs = scan(uid)
+        day = datetime.date.today().isoformat()
+        for app in apps:
+            if running(app, procs):
+                con.execute("INSERT INTO usage (day, app, seconds) VALUES (?, ?, ?) "
+                            "ON CONFLICT(day, app) DO UPDATE SET seconds = seconds + excluded.seconds",
+                            (day, app.get("name", "?"), elapsed))
+        con.commit()
+
+        if last_prune != day:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=KEEP_DAYS)).isoformat()
+            con.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
+            con.commit()
+            last_prune = day
+
+
+if __name__ == "__main__":
+    main()
