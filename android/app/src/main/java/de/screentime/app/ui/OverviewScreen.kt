@@ -10,6 +10,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -47,6 +48,7 @@ fun OverviewScreen(state: AppState) {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         TodayCard(s)
+        QuickCard(state, s)
         BonusCard(state)
         if (s.ptEnabled) PlaytimeCard(state, s)
         UsageCard(s)
@@ -191,6 +193,82 @@ private fun UsageCard(s: Status) {
             "Gezählt wird, solange ein Programm in seiner Sitzung läuft – auch im Hintergrund.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun QuickCard(state: AppState, s: Status) {
+    val name = s.child.replaceFirstChar { it.uppercase() }
+    var confirmLock by remember { mutableStateOf(false) }
+    var message by rememberSaveable { mutableStateOf("") }
+
+    Section("Sofort") {
+        if (s.locked) {
+            Text(
+                "🔒 PC ist gesperrt – $name kann sich nicht anmelden oder entsperren.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Button(
+                onClick = { state.act("PC entsperrt") { state.api.unlock() } },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Entsperren") }
+        } else {
+            Button(
+                onClick = { confirmLock = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) { Text("PC sofort sperren") }
+        }
+
+        Text("$name rufen", style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("Essen ist fertig!", "Komm bitte mal!").forEach { t ->
+                FilledTonalButton(
+                    onClick = { state.act("Nachricht gesendet") { state.api.callChild(t) } },
+                    modifier = Modifier.weight(1f),
+                ) { Text(t, maxLines = 1) }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = message,
+                onValueChange = { message = it.take(200) },
+                label = { Text("Eigene Nachricht") },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            FilledTonalButton(
+                enabled = message.isNotBlank(),
+                onClick = {
+                    val t = message.trim()
+                    state.act("Nachricht gesendet", onSuccess = { message = "" }) { state.api.callChild(t) }
+                },
+            ) { Text("Rufen") }
+        }
+        Text(
+            "Die Nachricht erscheint mit Ton auf dem PC-Bildschirm, wenn $name angemeldet ist.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    if (confirmLock) {
+        AlertDialog(
+            onDismissRequest = { confirmLock = false },
+            title = { Text("PC sofort sperren?") },
+            text = { Text("Der Bildschirm wird gesperrt und $name kann sich nicht mehr anmelden, bis du entsperrst. Offene Programme bleiben erhalten, die Zeit läuft währenddessen nicht.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLock = false
+                    state.act("PC gesperrt") { state.api.lock() }
+                }) { Text("Sperren") }
+            },
+            dismissButton = { TextButton(onClick = { confirmLock = false }) { Text("Abbrechen") } },
         )
     }
 }

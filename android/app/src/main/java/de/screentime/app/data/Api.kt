@@ -29,6 +29,8 @@ data class Status(
     val usageToday: Map<String, Int>,
     val usageWeek: Map<String, Int>,
     val apps: List<TrackedApp>,
+    /** PC gesperrt (Kinderkonto deaktiviert, Bildschirm gesperrt) */
+    val locked: Boolean,
 )
 
 data class DayLimit(val day: Int, val allowed: Boolean, val secs: Int)
@@ -82,7 +84,13 @@ class Api(private val store: Store) {
             )
         }
         val j = JSONObject(line)
-        if (!j.optBoolean("ok")) throw ApiException(j.optString("error", "Unbekannter Fehler auf dem PC"))
+        if (!j.optBoolean("ok")) {
+            val err = j.optString("error", "Unbekannter Fehler auf dem PC")
+            if (err == "Unbekannter Befehl") throw ApiException(
+                "Diese Funktion kennt der PC noch nicht. Bitte das Installationsskript auf dem PC erneut ausführen."
+            )
+            throw ApiException(err)
+        }
         return j
     }
 
@@ -120,6 +128,20 @@ class Api(private val store: Store) {
             )
         }
         call("apps ${b64(arr.toString())}")
+    }
+
+    /** PC sofort sperren: Bildschirm sperren und Anmelden verhindern, bis [unlock] aufgerufen wird. */
+    fun lock() {
+        call("lock")
+    }
+
+    fun unlock() {
+        call("unlock")
+    }
+
+    /** Zeigt [text] mit Ton auf dem Bildschirm des Kindes. */
+    fun callChild(text: String) {
+        call("call ${b64(text.take(200))}")
     }
 
     private fun b64(s: String) = Base64.getEncoder().encodeToString(s.toByteArray(Charsets.UTF_8))
@@ -172,6 +194,7 @@ class Api(private val store: Store) {
                 usageToday = strMap(usage.optJSONObject("today")),
                 usageWeek = strMap(usage.optJSONObject("week")),
                 apps = apps,
+                locked = j.optBoolean("locked"),
             )
         }
     }

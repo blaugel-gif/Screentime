@@ -5,6 +5,8 @@ sehen und steuern – über [Timekpr-nExT](https://launchpad.net/timekpr-next).
 
 - Restzeit, genutzte Zeit und Tageslimit live anzeigen
 - Bonuszeit geben oder abziehen, „Für heute beenden“
+- PC sofort sperren und wieder entsperren
+- Kind rufen: Nachricht mit Ton auf dem PC-Bildschirm
 - Tageslimits je Wochentag, erlaubte Uhrzeiten und Sperrart ändern
 - Spielzeit-Limit für ausgewählte Programme (z. B. Minecraft, Steam)
 - Nutzungszeit pro Programm (heute / letzte 7 Tage)
@@ -57,7 +59,7 @@ Updates: einfach den Link oben erneut öffnen und drüberinstallieren.
 
 | Reiter | Inhalt |
 |---|---|
-| **Heute** | Restzeit, Bonus (+15/+30/+60, −15, eigene Minuten), Für heute beenden, Spielzeit, Nutzung pro Programm |
+| **Heute** | Restzeit, Sofort sperren/entsperren, Rufen, Bonus (+15/+30/+60, −15, eigene Minuten), Für heute beenden, Spielzeit, Nutzung pro Programm |
 | **Limits** | Zeit pro Wochentag, erlaubte Uhrzeit, Spielzeit-Limit, was bei Zeitablauf passiert |
 | **Programme** | Welche Programme erfasst werden und welche als „Spiel“ zählen |
 | **Einstellungen** | Verbindung, PC-Schlüssel |
@@ -75,6 +77,13 @@ Von unterwegs funktioniert die App nur über ein VPN ins Heimnetz
   eigenem Passwort). Empfohlen: „Abmelden“.
 - Der PC-Schlüssel wird beim ersten Verbinden gespeichert; danach verbindet
   sich die App nur noch mit genau diesem PC.
+
+- **Sofort sperren** sperrt den Bildschirm und deaktiviert das Passwort des
+  Kinderkontos, bis in der App „Entsperren“ gedrückt wird – auch über einen
+  Neustart hinweg. Offene Programme bleiben erhalten.
+- **Rufen** zeigt eine Nachricht mit Ton, wenn das Kind angemeldet ist.
+- Nach einem Update der App das Installationsskript auf dem PC **erneut
+  ausführen**, damit neue Funktionen dort ankommen.
 
 ## Deinstallieren (PC)
 

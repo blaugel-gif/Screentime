@@ -14,17 +14,21 @@ Befehle:
     playbonus <+|-|=> <sek>    Spielzeit ändern
     limits <base64-json>       Tageslimits, Uhrzeiten, Spielzeit, Sperrart setzen
     apps <base64-json>         Liste der erfassten Programme speichern
+    lock                       PC sofort sperren (Bildschirm + Anmeldung), bis entsperrt
+    unlock                     Sperre wieder aufheben
+    call <base64-text>         Nachricht mit Ton auf dem Bildschirm des Kindes zeigen
 """
 import base64
 import datetime
 import json
 import os
+import pwd
 import re
 import sqlite3
 import subprocess
 import sys
 
-VERSION = 1
+VERSION = 2
 CONF_DIR = "/etc/screentime"
 CONFIG = os.path.join(CONF_DIR, "config.json")
 APPS = os.path.join(CONF_DIR, "apps.json")
@@ -160,6 +164,89 @@ def app_usage():
     return res
 
 
+# ---------------------------------------------------------------- Sperre & Rufen
+
+def run(*args, timeout=15):
+    try:
+        return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def is_locked(user):
+    """Gesperrt = Passwort des Kinderkontos ist per usermod -L deaktiviert."""
+    p = run("passwd", "-S", user)
+    if p is None or p.returncode != 0:
+        return False
+    parts = p.stdout.split()
+    return len(parts) > 1 and parts[1] == "L"
+
+
+def child_sessions(user):
+    p = run("loginctl", "show-user", user, "-p", "Sessions", "--value")
+    if p is None or p.returncode != 0:
+        return []
+    return [x for x in p.stdout.split() if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", x)]
+
+
+def notify(user, title, body, critical=True):
+    """Zeigt eine Meldung in der grafischen Sitzung des Kindes. True, wenn es geklappt hat."""
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return False
+    bus = "/run/user/%d/bus" % uid
+    if not os.path.exists(bus):
+        return False
+    env = ["env", "DBUS_SESSION_BUS_ADDRESS=unix:path=" + bus, "XDG_RUNTIME_DIR=/run/user/%d" % uid]
+    args = ["runuser", "-u", user, "--", *env, "notify-send", "--app-name=Screentime",
+            "--icon=dialog-information", "--hint=string:sound-name:message-new-instant"]
+    if critical:
+        args.append("--urgency=critical")
+    p = run(*args, title, body)
+    ok = p is not None and p.returncode == 0
+    # Zusätzlich hörbar machen (falls vorhanden)
+    for snd in ("/usr/share/sounds/freedesktop/stereo/complete.oga",
+                "/usr/share/sounds/freedesktop/stereo/bell.oga"):
+        if os.path.exists(snd):
+            run("runuser", "-u", user, "--", *env, "paplay", snd, timeout=10)
+            break
+    return ok
+
+
+def cmd_lock():
+    user = child()
+    notify(user, "PC wird gesperrt", "Deine Eltern haben den PC gesperrt.")
+    p = run("usermod", "-L", user)
+    if p is None or p.returncode != 0:
+        fail("Sperren fehlgeschlagen: %s" % ((p.stderr if p else "usermod fehlt")[-200:]))
+    for sid in child_sessions(user):
+        run("loginctl", "lock-session", sid)
+    out({"ok": True, "locked": True})
+
+
+def cmd_unlock():
+    user = child()
+    p = run("usermod", "-U", user)
+    if p is None or p.returncode != 0:
+        fail("Entsperren fehlgeschlagen: %s" % ((p.stderr if p else "usermod fehlt")[-200:]))
+    out({"ok": True, "locked": False})
+
+
+def cmd_call(b64text):
+    user = child()
+    try:
+        text = base64.b64decode(b64text, validate=True).decode("utf-8")
+    except Exception:
+        fail("Ungültige Nachricht")
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f<>&]", "", text).strip()[:200] or "Bitte komm mal!"
+    if not child_sessions(user):
+        fail("%s ist gerade nicht am PC angemeldet." % user.capitalize())
+    if not notify(user, "Nachricht von deinen Eltern", text):
+        fail("Die Nachricht konnte nicht angezeigt werden (ist notify-send installiert?)")
+    out({"ok": True})
+
+
 # ---------------------------------------------------------------- Befehle
 
 def cmd_status():
@@ -230,6 +317,7 @@ def cmd_status():
             "spent": pt_spent,
             "left": pt_left,
         },
+        "locked": is_locked(user),
         "usage": app_usage(),
         "apps": load_json(APPS, []),
         "raw": {"info": info, "rt": rt},
@@ -354,6 +442,12 @@ def main():
         cmd_limits(b64json(a[1]))
     if cmd == "apps" and len(a) == 2:
         cmd_apps(b64json(a[1]))
+    if cmd == "lock" and len(a) == 1:
+        cmd_lock()
+    if cmd == "unlock" and len(a) == 1:
+        cmd_unlock()
+    if cmd == "call" and len(a) == 2:
+        cmd_call(a[1])
     fail("Unbekannter Befehl")
 
 
