@@ -17,6 +17,8 @@ Befehle:
     lock                       PC sofort sperren (Bildschirm + Anmeldung), bis entsperrt
     unlock                     Sperre wieder aufheben
     call <base64-text>         Nachricht mit Ton auf dem Bildschirm des Kindes zeigen
+    voice                      Sprachanruf: klingelt beim Kind; nach „Annehmen“ läuft
+                               Audio (16 kHz, mono, s16le) über stdin/stdout
 """
 import base64
 import datetime
@@ -27,8 +29,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 
-VERSION = 2
+VERSION = 3
 CONF_DIR = "/etc/screentime"
 CONFIG = os.path.join(CONF_DIR, "config.json")
 APPS = os.path.join(CONF_DIR, "apps.json")
@@ -247,6 +251,187 @@ def cmd_call(b64text):
     out({"ok": True})
 
 
+# ---------------------------------------------------------------- Sprachanruf
+
+RATE = 16000
+MAX_CALL = 30 * 60
+RING_TIMEOUT = 40
+RING_SOUND = "/usr/share/sounds/freedesktop/stereo/phone-incoming-call.oga"
+
+
+def user_env(user):
+    uid = pwd.getpwnam(user).pw_uid
+    rt = "/run/user/%d" % uid
+    return ["runuser", "-u", user, "--", "env", "XDG_RUNTIME_DIR=" + rt,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=%s/bus" % rt, "PULSE_SERVER=unix:%s/pulse/native" % rt]
+
+
+def header(obj):
+    sys.stdout.buffer.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def ask(env, title, body, actions, timeout=None):
+    """Zeigt eine Meldung mit Knöpfen. Liefert (Prozess, Meldungs-ID-Getter)."""
+    args = [*env, "notify-send", "--app-name=Screentime", "--urgency=critical",
+            "--icon=call-start", "--print-id", "--wait"]
+    for key, label in actions:
+        args.append("--action=%s=%s" % (key, label))
+    return subprocess.Popen(args + [title, body], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+
+def close_note(env, proc):
+    """Meldung schließen (ID steht in der ersten Ausgabezeile von notify-send --print-id)."""
+    nid = getattr(proc, "note_id", None)
+    if nid:
+        run(*env, "gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.Notifications.CloseNotification", nid, timeout=5)
+    if proc.poll() is None:
+        proc.kill()
+
+
+EARLY = bytearray()  # Audio, das schon vor „Annehmen“ ankam
+
+
+def phone_gone():
+    """True, wenn das Handy die Verbindung schon wieder geschlossen hat (stdin am Ende)."""
+    import select
+    fd = sys.stdin.buffer.fileno()
+    r, _, _ = select.select([fd], [], [], 0)
+    if not r:
+        return False
+    data = os.read(fd, 4096)
+    if not data:
+        return True
+    EARLY.extend(data)
+    return False
+
+
+def read_action(proc, timeout, cancel=None):
+    """Wartet auf einen Klick. Liefert den Schlüssel der Aktion, "cancel" oder None."""
+    result = {}
+
+    def reader():
+        first = proc.stdout.readline().strip()
+        if first.isdigit():
+            proc.note_id = first
+            result["action"] = proc.stdout.readline().strip()
+        else:
+            result["action"] = first
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    end = time.time() + timeout
+    while t.is_alive() and time.time() < end:
+        t.join(0.5)
+        if cancel and cancel():
+            return "cancel"
+    return result.get("action") or None
+
+
+def cmd_voice():
+    user = child()
+    if not child_sessions(user) or not os.path.exists("/run/user/%d/bus" % pwd.getpwnam(user).pw_uid):
+        header({"ok": False, "error": "%s ist gerade nicht am PC angemeldet." % user.capitalize()})
+        return
+    if is_locked(user):
+        header({"ok": False, "error": "Der PC ist gesperrt. Bitte zuerst entsperren."})
+        return
+    env = user_env(user)
+
+    # 1) Klingeln, bis angenommen, abgelehnt oder Zeit abgelaufen
+    ringing = threading.Event()
+    ringing.set()
+
+    def ring():
+        while ringing.is_set():
+            if os.path.exists(RING_SOUND):
+                run(*env, "paplay", RING_SOUND, timeout=10)
+            else:
+                time.sleep(1)
+
+    threading.Thread(target=ring, daemon=True).start()
+    note = ask(env, "📞 Anruf von deinen Eltern", "Annehmen, um zu sprechen.",
+               [("accept", "Annehmen"), ("decline", "Ablehnen")])
+    action = read_action(note, RING_TIMEOUT, cancel=phone_gone)
+    ringing.clear()
+    close_note(env, note)
+    if action == "cancel":
+        run(*env, "notify-send", "--app-name=Screentime", "--icon=call-stop", "Verpasster Anruf",
+            "Deine Eltern haben angerufen.", timeout=5)
+        return
+    if action != "accept":
+        header({"ok": False, "error": "%s hat abgelehnt." % user.capitalize() if action == "decline"
+                else "%s hat nicht angenommen." % user.capitalize()})
+        return
+
+    # 2) Echo-Unterdrückung versuchen (PipeWire/PulseAudio), sonst Standardgeräte
+    ec_mod = None
+    src = sink = []
+    p = run(*env, "pactl", "load-module", "module-echo-cancel", "aec_method=webrtc",
+            "source_name=screentime_ec_src", "sink_name=screentime_ec_sink", timeout=10)
+    if p is not None and p.returncode == 0 and p.stdout.strip().isdigit():
+        ec_mod = p.stdout.strip()
+        src = ["--device=screentime_ec_src"]
+        sink = ["--device=screentime_ec_sink"]
+
+    fmt = ["--raw", "--format=s16le", "--rate=%d" % RATE, "--channels=1", "--latency-msec=60",
+           "--client-name=Screentime"]
+    rec = subprocess.Popen([*env, "parec", *fmt, *src, "--stream-name=Anruf"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    play = subprocess.Popen([*env, "pacat", "--playback", *fmt, *sink, "--stream-name=Anruf"],
+                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    header({"ok": True, "rate": RATE})
+
+    done = threading.Event()
+
+    def pc_to_phone():
+        try:
+            while not done.is_set():
+                buf = rec.stdout.read1(1280) if hasattr(rec.stdout, "read1") else rec.stdout.read(1280)
+                if not buf:
+                    break
+                sys.stdout.buffer.write(buf)
+                sys.stdout.buffer.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        done.set()
+
+    def phone_to_pc():
+        try:
+            if EARLY:
+                play.stdin.write(bytes(EARLY))
+                play.stdin.flush()
+            while not done.is_set():
+                buf = os.read(sys.stdin.buffer.fileno(), 1280)
+                if not buf:
+                    break
+                play.stdin.write(buf)
+                play.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        done.set()
+
+    hang = ask(env, "📞 Gespräch mit deinen Eltern", "Läuft gerade.", [("hangup", "Auflegen")])
+
+    def watch_hangup():
+        if read_action(hang, MAX_CALL) == "hangup":
+            done.set()
+
+    for f in (pc_to_phone, phone_to_pc, watch_hangup):
+        threading.Thread(target=f, daemon=True).start()
+    done.wait(MAX_CALL)
+
+    for proc in (rec, play):
+        if proc.poll() is None:
+            proc.kill()
+    close_note(env, hang)
+    if ec_mod:
+        run(*env, "pactl", "unload-module", ec_mod, timeout=10)
+    run(*env, "notify-send", "--app-name=Screentime", "--icon=call-stop", "Anruf beendet", "", timeout=5)
+
+
 # ---------------------------------------------------------------- Befehle
 
 def cmd_status():
@@ -448,6 +633,13 @@ def main():
         cmd_unlock()
     if cmd == "call" and len(a) == 2:
         cmd_call(a[1])
+    if cmd == "voice" and len(a) == 1:
+        cmd_voice()
+        try:
+            sys.stdout.buffer.flush()
+        except OSError:
+            pass
+        os._exit(0)  # Lesethreads hängen evtl. noch an stdin
     fail("Unbekannter Befehl")
 
 

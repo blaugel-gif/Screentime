@@ -7,6 +7,7 @@ sehen und steuern – über [Timekpr-nExT](https://launchpad.net/timekpr-next).
 - Bonuszeit geben oder abziehen, „Für heute beenden“
 - PC sofort sperren und wieder entsperren
 - Kind rufen: Nachricht mit Ton auf dem PC-Bildschirm
+- Sprachanruf zum PC: Mikrofon und Lautsprecher des PCs, das Kind nimmt per Klick an
 - Tageslimits je Wochentag, erlaubte Uhrzeiten und Sperrart ändern
 - Spielzeit-Limit für ausgewählte Programme (z. B. Minecraft, Steam)
 - Nutzungszeit pro Programm (heute / letzte 7 Tage)
@@ -82,6 +83,10 @@ Von unterwegs funktioniert die App nur über ein VPN ins Heimnetz
   Kinderkontos, bis in der App „Entsperren“ gedrückt wird – auch über einen
   Neustart hinweg. Offene Programme bleiben erhalten.
 - **Rufen** zeigt eine Nachricht mit Ton, wenn das Kind angemeldet ist.
+- **Anrufen** klingelt am PC. Erst wenn das Kind auf „Annehmen“ klickt, werden
+  Mikrofon und Lautsprecher am PC eingeschaltet; es kann jederzeit auflegen.
+  Mit Headset am PC klingt es am besten (sonst evtl. Echo). Die App während des
+  Gesprächs geöffnet lassen.
 - Nach einem Update der App das Installationsskript auf dem PC **erneut
   ausführen**, damit neue Funktionen dort ankommen.
 

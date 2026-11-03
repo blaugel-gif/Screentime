@@ -100,6 +100,35 @@ object Ssh {
         }
     }
 
+    /**
+     * Öffnet einen dauerhaften Kanal (für den Sprachanruf). Der Aufrufer liest
+     * [SshStream.input], schreibt [SshStream.output] und ruft am Ende [SshStream.close].
+     */
+    fun stream(c: Conn, command: String, timeoutMs: Int = 20_000): SshStream {
+        val jsch = JSch()
+        val repo = TofuRepo(c.hostKey.ifBlank { null })
+        jsch.hostKeyRepository = repo
+        val session = jsch.getSession(c.user, c.host, c.port)
+        session.setPassword(c.password)
+        session.userInfo = PasswordInfo(c.password)
+        session.setConfig("StrictHostKeyChecking", "yes")
+        session.setConfig("PreferredAuthentications", "password,keyboard-interactive")
+        try {
+            session.connect(timeoutMs)
+            session.setServerAliveInterval(10_000)
+            val ch = session.openChannel("exec") as ChannelExec
+            ch.setCommand(command)
+            ch.setErrStream(ByteArrayOutputStream())
+            val input = ch.inputStream
+            val output = ch.outputStream
+            ch.connect(timeoutMs)
+            return SshStream(session, ch, input, output, repo.seen)
+        } catch (e: JSchException) {
+            session.disconnect()
+            throw friendly(e, repo.mismatch)
+        }
+    }
+
     private fun friendly(e: JSchException, mismatch: Boolean): Exception {
         val msg = e.message ?: ""
         return when {
@@ -114,5 +143,19 @@ object Ssh {
                 ApiException("PC nicht erreichbar. Ist er an und bist du im selben WLAN (oder per VPN verbunden)?")
             else -> ApiException("Verbindungsfehler: $msg")
         }
+    }
+}
+
+class SshStream(
+    private val session: com.jcraft.jsch.Session,
+    private val channel: ChannelExec,
+    val input: java.io.InputStream,
+    val output: java.io.OutputStream,
+    val hostKey: String?,
+) {
+    fun close() {
+        runCatching { output.close() }
+        runCatching { channel.disconnect() }
+        runCatching { session.disconnect() }
     }
 }

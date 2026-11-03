@@ -27,7 +27,7 @@ fi
 
 say "1/5  Pakete installieren (SSH, Timekpr, Python, Benachrichtigungen) …"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server timekpr-next python3 wget libnotify-bin pulseaudio-utils sound-theme-freedesktop >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server timekpr-next python3 wget libnotify-bin libglib2.0-bin pulseaudio-utils sound-theme-freedesktop >/dev/null
 
 say "2/5  Programme installieren …"
 SRC=""

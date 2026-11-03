@@ -62,7 +62,7 @@ data class LimitsEdit(
 }
 
 /** Spricht per SSH mit screentime-ctl auf dem PC. Alle Funktionen blockieren (im IO-Thread aufrufen). */
-class Api(private val store: Store) {
+class Api(val store: Store) {
 
     private fun call(args: String): JSONObject {
         val c = store.conn()

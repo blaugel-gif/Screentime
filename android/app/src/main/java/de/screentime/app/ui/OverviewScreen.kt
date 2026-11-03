@@ -32,6 +32,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import de.screentime.app.data.Status
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.Card
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import de.screentime.app.data.VoiceCall
+import kotlinx.coroutines.delay
 
 @Composable
 fun OverviewScreen(state: AppState) {
@@ -202,6 +216,16 @@ private fun QuickCard(state: AppState, s: Status) {
     val name = s.child.replaceFirstChar { it.uppercase() }
     var confirmLock by remember { mutableStateOf(false) }
     var message by rememberSaveable { mutableStateOf("") }
+    val ctx = LocalContext.current
+    var call by remember { mutableStateOf<VoiceCall?>(null) }
+    fun startCall() {
+        val v = VoiceCall(ctx, state.api.store, name)
+        call = v
+        v.start()
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startCall()
+    }
 
     Section("Sofort") {
         if (s.locked) {
@@ -223,6 +247,23 @@ private fun QuickCard(state: AppState, s: Status) {
                     contentColor = MaterialTheme.colorScheme.onError,
                 ),
             ) { Text("PC sofort sperren") }
+        }
+
+        FilledTonalButton(
+            enabled = s.live && !s.locked,
+            onClick = {
+                if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) startCall()
+                else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("📞 $name anrufen (über den PC)") }
+        if (!s.live) {
+            Text(
+                "Anrufen geht nur, wenn $name am PC angemeldet ist.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         Text("$name rufen", style = MaterialTheme.typography.labelLarge)
@@ -257,6 +298,8 @@ private fun QuickCard(state: AppState, s: Status) {
         )
     }
 
+    call?.let { v -> CallDialog(v, name, onClose = { call = null }) }
+
     if (confirmLock) {
         AlertDialog(
             onDismissRequest = { confirmLock = false },
@@ -272,3 +315,73 @@ private fun QuickCard(state: AppState, s: Status) {
         )
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CallDialog(call: VoiceCall, name: String, onClose: () -> Unit) {
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        view.keepScreenOn = true
+        onDispose {
+            view.keepScreenOn = false
+            call.hangUp()
+        }
+    }
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(call.phase) {
+        while (call.phase == VoiceCall.Phase.ACTIVE) {
+            now = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+
+    Dialog(
+        onDismissRequest = {},
+        properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
+    ) {
+        Card(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier.fillMaxWidth().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text("📞 $name", style = MaterialTheme.typography.headlineSmall)
+                Text(
+                    when (call.phase) {
+                        VoiceCall.Phase.CONNECTING -> "Verbinde …"
+                        VoiceCall.Phase.RINGING -> "Klingelt bei $name …"
+                        VoiceCall.Phase.ACTIVE -> fmtClock(((now - call.startedAt) / 1000).toInt())
+                        VoiceCall.Phase.ENDED -> call.endMessage ?: "Beendet"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                if (call.phase == VoiceCall.Phase.ACTIVE) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = call.muted, onClick = { call.muted = !call.muted },
+                            label = { Text(if (call.muted) "Stumm" else "Mikro an") },
+                        )
+                        FilterChip(
+                            selected = call.speaker, onClick = { call.toggleSpeaker() },
+                            label = { Text("Lautsprecher") },
+                        )
+                    }
+                }
+                if (call.phase == VoiceCall.Phase.ENDED) {
+                    TextButton(onClick = onClose) { Text("Schließen") }
+                } else {
+                    Button(
+                        onClick = { call.hangUp() },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError,
+                        ),
+                    ) { Text("Auflegen") }
+                }
+            }
+        }
+    }
+}
+
+private fun fmtClock(sec: Int): String = "%d:%02d".format(sec / 60, sec % 60)
